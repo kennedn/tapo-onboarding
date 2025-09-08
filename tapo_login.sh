@@ -33,8 +33,8 @@ tapo_tag() {
     local cnonce=$2
     local seq=$3
     local payload=$4
-    tag=$(printf "%s" "${hashed_password}${cnonce}" | openssl dgst -sha256 -r | awk '{print toupper($1)}')
-    printf "%s" "${tag}${payload}${seq}" | openssl dgst -sha256 -r | awk '{print toupper($1)}'
+    tag=$(sha256 "${hashed_password}${cnonce}")
+    sha256 "${tag}${payload}${seq}"
 }
 
 login() {

@@ -1,11 +1,17 @@
 #!/bin/bash
+set -euo pipefail
+
+sha256() {
+    local value=$1
+    printf "%s" "${value}" | openssl dgst -sha256 -r | awk '{print toupper($1)}'
+}
 
 generate_encryption_token() {
     local name=$1
     local nonce=$2
     local cnonce=$3
     local hashed_key=$4
-    printf "%s" "${name}${cnonce}${nonce}${hashed_key}" | sha256sum | awk '{print substr($1,1,32)}'
+    printf "%s" "${name}${cnonce}${nonce}${hashed_key}" | openssl dgst -sha256 -r | awk '{print substr($1,1,32)}'
 }
 
 encrypt_string() {
@@ -27,116 +33,143 @@ tapo_tag() {
     local cnonce=$2
     local seq=$3
     local payload=$4
-    tag=$(printf "%s" "${hashed_password}${cnonce}" | sha256sum | awk '{print toupper($1)}')
-    printf "%s" "${tag}${payload}${seq}" | sha256sum | awk '{print toupper($1)}'
+    tag=$(printf "%s" "${hashed_password}${cnonce}" | openssl dgst -sha256 -r | awk '{print toupper($1)}')
+    printf "%s" "${tag}${payload}${seq}" | openssl dgst -sha256 -r | awk '{print toupper($1)}'
 }
 
-cnonce=$(openssl rand -hex 8 | tr '[:lower:]' '[:upper:]')
-url="https://${1}"
-password="${2}"
-JSON=$(jq -cn \
-    --arg cnonce "$cnonce" \
-    '{
-        method: "login",
-        params: {
-            cnonce: $cnonce,
-            encrypt_type: "3",
-            username: "admin"
-        }
-    }'
-)
-login1=$(
-curl --connect-timeout 3 \
-    -H "Content-Type: application/json" \
-    -H 'User-Agent: Tapo CameraClient Android' \
-    -kX POST \
-    -d "${JSON}" \
-    "${url}"
-)
-
-read -r nonce device_confirm <<<"$(jq -r '.result.data | [.nonce, .device_confirm] | join(" ")' <<<"${login1}")"
-
-hashed_password="$(printf "%s" "${password}" | sha256sum | awk '{print toupper($1)}')"
-hashed_key="$(printf "%s" "${cnonce}${hashed_password}${nonce}" | sha256sum | awk '{print toupper($1)}')"
-client_device_confirm="${hashed_key}${nonce}${cnonce}"
-
-[ "${client_device_confirm}" != "${device_confirm}" ] && echo "Password seems incorrect" && exit 1
-
-digest_password="$(printf "%s" "${hashed_password}${cnonce}${nonce}" | sha256sum | awk '{print toupper($1)}')${cnonce}${nonce}"
-
-JSON=$(jq -cn \
-    --arg cnonce "$cnonce" \
-    --arg digest_password "$digest_password" \
-    '{
-        method: "login",
-        params: {
-            cnonce: $cnonce,
-            encrypt_type: "3",
-            digest_passwd: $digest_password,
-            username: "admin"
-        }
-    }'
-)
-login2=$(
-curl --connect-timeout 3 \
-    -H "Content-Type: application/json" \
-    -H 'User-Agent: Tapo CameraClient Android' \
-    -kX POST \
-    -d "${JSON}" \
-    "${url}"
-)
-
-read -r seq stok <<<"$(jq -r '.result | [.start_seq, .stok] | join(" ")' <<<"${login2}")"
-
-lsk=$(generate_encryption_token "lsk" "${nonce}" "${cnonce}" "${hashed_key}")
-ivb=$(generate_encryption_token "ivb" "${nonce}" "${cnonce}" "${hashed_key}")
-
-INNER_JSON=$(jq -cn \
-    '{
-      method: "multipleRequest",
-      params: {
-        requests: [
-          {
-            method: "getDeviceInfo",
+login() {
+    local url="https://${1}"
+    local password="${2}"
+    local cnonce=$(openssl rand -hex 8 | awk '{print toupper($1)}')
+    body=$(jq -cn \
+        --arg cnonce "$cnonce" \
+        '{
+            method: "login",
             params: {
-              device_info: {
-                name: [
-                  "basic_info"
-                ]
-              }
+                cnonce: $cnonce,
+                encrypt_type: "3",
+                username: "admin"
             }
+        }'
+    )
+    phase1=$(
+    curl --connect-timeout 3 \
+        -sS \
+        -H "Content-Type: application/json" \
+        -H 'User-Agent: Tapo CameraClient Android' \
+        -kX POST \
+        -d "${body}" \
+        "${url}"
+    )
+    read -r nonce device_confirm <<<"$(jq -r '.result.data | [.nonce, .device_confirm] | join(" ")' <<<"${phase1}")"
+
+    hashed_password=$(sha256 "${password}")
+    hashed_key=$(sha256 "${cnonce}${hashed_password}${nonce}")
+    client_device_confirm="${hashed_key}${nonce}${cnonce}"
+
+    [ "${client_device_confirm}" != "${device_confirm}" ] && echo "Password seems incorrect" && exit 1
+
+    digest_password="$(sha256 "${hashed_password}${cnonce}${nonce}")${cnonce}${nonce}"
+
+    body=$(jq -cn \
+        --arg cnonce "$cnonce" \
+        --arg digest_password "$digest_password" \
+        '{
+            method: "login",
+            params: {
+                cnonce: $cnonce,
+                encrypt_type: "3",
+                digest_passwd: $digest_password,
+                username: "admin"
+            }
+        }'
+    )
+
+    phase2=$(
+    curl --connect-timeout 3 \
+        -sS \
+        -H "Content-Type: application/json" \
+        -H 'User-Agent: Tapo CameraClient Android' \
+        -kX POST \
+        -d "${body}" \
+        "${url}"
+    )
+
+    read -r seq stok <<<"$(jq -r '.result | [.start_seq, .stok] | join(" ")' <<<"${phase2}")"
+
+    lsk=$(generate_encryption_token "lsk" "${nonce}" "${cnonce}" "${hashed_key}")
+    ivb=$(generate_encryption_token "ivb" "${nonce}" "${cnonce}" "${hashed_key}")
+
+    echo "${hashed_password} ${cnonce} ${lsk} ${ivb} ${seq} ${stok}"
+}
+
+getDeviceInfo() {
+    local url="https://${1}"
+    local hashed_password=$2
+    local cnonce=$3
+    local lsk=$4
+    local ivb=$5
+    local seq=$6
+    local stok=$7
+
+    inner_body=$(jq -cn \
+        '{
+          method: "multipleRequest",
+          params: {
+            requests: [
+              {
+                method: "getDeviceInfo",
+                params: {
+                  device_info: {
+                    name: [
+                      "basic_info"
+                    ]
+                  }
+                }
+              }
+            ]
           }
-        ]
-      }
-    }'
-)
+        }'
+    )
 
-payload=$(encrypt_string "${INNER_JSON}" "${lsk}" "${ivb}")
+    payload=$(encrypt_string "${inner_body}" "${lsk}" "${ivb}")
 
-JSON=$(jq -cn \
-    --arg payload "$payload" \
-    '{
-      method: "securePassthrough",
-      params: {
-        "request": $payload,
-      }
-    }'
-)
+    body=$(jq -cn \
+        --arg payload "$payload" \
+        '{
+          method: "securePassthrough",
+          params: {
+            "request": $payload,
+          }
+        }'
+    )
 
-tag=$(tapo_tag "${hashed_password}" "${cnonce}" "${seq}" "${JSON}")
+    tag=$(tapo_tag "${hashed_password}" "${cnonce}" "${seq}" "${body}")
 
-raw_response=$(
-curl --connect-timeout 3 \
-    -H "Content-Type: application/json" \
-    -H "tapo_tag: ${tag}" \
-    -H "seq: ${seq}" \
-    -H 'User-Agent: Tapo CameraClient Android' \
-    -kX POST \
-    -d "${JSON}" \
-    "${url}/stok=${stok}/ds"
-)
+    raw_response=$(
+    curl --connect-timeout 3 \
+        -sS \
+        -H "Content-Type: application/json" \
+        -H "tapo_tag: ${tag}" \
+        -H "seq: ${seq}" \
+        -H 'User-Agent: Tapo CameraClient Android' \
+        -kX POST \
+        -d "${body}" \
+        "${url}/stok=${stok}/ds"
+    )
 
-encrypted_response=$(jq -r '.result.response' <<<"${raw_response}")
+    encrypted_response=$(jq -r '.result.response' <<<"${raw_response}")
 
-decrypt_string "${encrypted_response}" "${lsk}" "${ivb}"
+    decrypt_string "${encrypted_response}" "${lsk}" "${ivb}"
+}
 
+main() {
+    local host=$1
+    local password=$2
+    read -r hashed_password cnonce lsk ivb seq stok  <<<"$(login "${host}" "${password}")"
+    getDeviceInfo "${host}" "${hashed_password}" "${cnonce}" "${lsk}" "${ivb}" "${seq}" "${stok}"
+}
+
+if [ "${BASH_SOURCE[0]}" == "$0" ]; then
+    main "$@"
+fi

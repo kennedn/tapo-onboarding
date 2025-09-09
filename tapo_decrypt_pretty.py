@@ -1,40 +1,16 @@
 # tapo_decrypt_view.py
 # Show Tapo decrypted JSON inline via a custom mitmproxy content view + handshake/decrypt addon.
 
-import os, json, base64, hashlib
+import os
+import json
+import base64
+import hashlib
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 
 from mitmproxy import http, ctx, contentviews
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
-
-import os
-import sys
-import threading
-import linecache
-
-# Toggle via env var to avoid always tracing
-_XTRACE_ENABLED = False
-
-# Restrict tracing to this directory (adjust if needed)
-_BASEDIR = os.path.dirname(__file__)
-
-def _xtrace(frame, event, arg):
-    if event != "line":
-        return _xtrace  # keep tracing into nested frames
-    filename = frame.f_code.co_filename
-    if "tapo_decrypt_pretty" not in filename:
-        return _xtrace  # skip stdlib/site-packages/mitmproxy internals
-    lineno = frame.f_lineno
-    src = linecache.getline(filename, lineno).rstrip()
-    # stderr is typical for xtrace-style output
-    sys.stderr.write(f"+ {os.path.basename(filename)}:{lineno}: {src}\n")
-    return _xtrace
-
-if _XTRACE_ENABLED:
-    sys.settrace(_xtrace)
-    threading.settrace(_xtrace)
 
 UA = "Tapo CameraClient Android"
 
@@ -73,7 +49,6 @@ class TapoSession:
         if not (self.cnonce and self.nonce and self.device_confirm):
             return False
         self.ensure_password_hashes()
-        print(f"{self.device_confirm=}, {self.nonce=}, {self.cnonce=},{self.sha_variant=},{self.hashed_sha256}")
         sha_variant = sha256_hex((self.cnonce + self.hashed_sha256 + self.nonce).encode("utf-8"))
         if self.device_confirm == (sha_variant + self.nonce + self.cnonce):
             self.encryption_method = EncryptionMethod.SHA256
@@ -153,7 +128,10 @@ class TapoDecryptor:
                         inner = sess.decrypt_b64_json(enc)
                         flow.metadata["tapo.request_decrypted"] = inner
                 except Exception as e:
+                    flow.metadata["tapo.request_error"] = "Could not decrypt request"
                     ctx.log.debug(f"Tapo request decrypt error: {e}")
+            else:
+                flow.metadata["tapo.request_error"] = "lsk and ivb are not set, was the login sequence captured?"
 
     def response(self, flow: http.HTTPFlow) -> None:
         if not self._ua_ok(flow):
@@ -170,19 +148,19 @@ class TapoDecryptor:
         m = req_json.get("method")
 
         if m == "login":
-            flow.metadata["tapo.phase"] = "loginready"
             result = resp_json.get("result") or {}
             data = (result.get("data") or {}) if isinstance(result, dict) else {}
-            print(data)
             nonce = data.get("nonce")
             device_confirm = data.get("device_confirm")
-            print(f"{nonce=},{device_confirm=}")
             if nonce and device_confirm:
                 sess.nonce = str(nonce)
                 sess.device_confirm = str(device_confirm)
                 if sess.validate_device_confirm():
                     sess.finalize_keys()
                     sess.ready = True
+                    flow.metadata["tapo.phase"] = "Device password matches TAPO_PASSWORD"
+                else:
+                    flow.metadata["tapo.phase"] = "password mismatch"
 
         if m == "securePassthrough":
             result = resp_json.get("result") or {}
@@ -192,7 +170,10 @@ class TapoDecryptor:
                     inner = sess.decrypt_b64_json(enc)
                     flow.metadata["tapo.response_decrypted"] = inner
                 except Exception as e:
+                    flow.metadata["tapo.response_error"] = "Could not decrypt response"
                     ctx.log.debug(f"Tapo response decrypt error: {e}")
+            else:
+                flow.metadata["tapo.response_error"] = "lsk and ivb are not set, was the login sequence captured?"
 
 # -------- Custom content view: show decrypted JSON inline ---------------------
 

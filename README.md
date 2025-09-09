@@ -141,7 +141,7 @@ Connect the computer running mitmproxy to the Tapo devices Access Point
 
 Add new device in Tapo app:
 
-<video src="./media/app-setup.mp4" height=480 controls></video>
+https://github.com/user-attachments/assets/0ea26278-5c9d-4d06-bbce-20498fcc595f
 
 The onboarding calls should be captured in mitmproxy:
 

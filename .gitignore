@@ -1,3 +1,4 @@
 __pycache__
 .venv
 tapo_capture*.json
+pubkey.pem

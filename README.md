@@ -19,7 +19,7 @@ Tools and notes for onboarding TP-Link Tapo cameras that use the v3 encryption m
 
 ## Cloudless Onboarding (`tapo_onboard.sh`)
 
-This script performs the complete onboarding flow:
+This script performs a complete onboard for a Tapo Camera:
 
 * Login with the default password
 * Scan for Wi-Fi and interactively select an AP
@@ -35,6 +35,10 @@ This script performs the complete onboarding flow:
 
 ### Usage
 
+Connect to the Wifi access point of the tapo device.
+
+Run script:
+
 ```bash
 ./tapo_onboard.sh <camera-host-or-ip> <new_password>
 ```
@@ -42,7 +46,7 @@ This script performs the complete onboarding flow:
 Example:
 
 ```bash
-❯ ./tapo_onboard.sh 192.168.1.165 'MyNewPassword123'
+❯ ./tapo_onboard.sh 192.168.191.1 'MyNewPassword123'
 Scanning for Wifi access points...
 Disable tapo logo
 Configure RTSP / ONVIF account

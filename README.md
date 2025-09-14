@@ -102,20 +102,30 @@ Example:
 
 ---
 
-## Protocol Overview (high level)
+## Protocol Diagram
 
-1. Client POSTs `{"method":"login","params":{"cnonce":...,"encrypt_type":"3","username":"admin"}}`.
-2. Device replies with `{ data: { nonce, device_confirm } }`.
-3. Client validates `device_confirm` and derives:
+```mermaid
+%%{init: { 'sequence': {'noteAlign': 'left'} }}%%
+sequenceDiagram
+    participant C as Client
+    participant D as Tapo Device
 
-   * `hashed_password = SHA256(password).upper()`
-   * `hashed_key = SHA256(cnonce + hashed_password + nonce).upper()`
-   * Session tokens:  
-     `lsk = SHA256("lsk" + cnonce + nonce + hashed_key)[0:16]`  
-     `ivb = SHA256("ivb" + cnonce + nonce + hashed_key)[0:16]`
-4. Client sends second `login` with `digest_passwd = SHA256(hashed_password + cnonce + nonce).upper() + cnonce + nonce`.
-5. Subsequent API calls go via `{"method":"securePassthrough","params":{"request": base64(AES-128-CBC(lsk, ivb, json))}}` and are accompanied by `tapo_tag`/`seq` headers.
+    C->>D: POST login { cnonce, encrypt_type:"3", username:"admin" }
+    D-->>C: { data: { nonce, device_confirm } }
 
+    C->>C: Perform local derivations
+    Note right of C: hashed_password = SHA256(password).upper()<br/>hashed_key = SHA256(cnonce + hashed_password + nonce).upper()<br/>lsk = SHA256("lsk" + cnonce + nonce + hashed_key)[0:16]<br/>ivb = SHA256("ivb" + cnonce + nonce + hashed_key)[0:16]<br/>digest_passwd = SHA256(hashed_password + cnonce + nonce).upper() + cnonce + nonce
+
+    C->>D: POST login { digest_passwd, cnonce, nonce, username:"admin" }
+    D-->>C: { seq, stok }
+
+
+    C->>C: Calculate tapo_tag
+    Note right of C: tapo_tag = SHA256(SHA256(hashed_password+cnonce)+payload+seq)<br/>seq=seq+1
+
+    C->>D: securePassthrough { request: base64(AES-128-CBC(lsk, ivb, json)), headers:{ tapo_tag, seq } }
+    D-->>C: Encrypted response (AES-128-CBC)
+```
 ---
 
 ## Capturing onboarding calls from Tapo App

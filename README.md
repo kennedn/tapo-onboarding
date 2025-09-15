@@ -1,5 +1,7 @@
 # Tapo-Onboarding
 
+> For a deeper dive into the motivations and tribulations of this project, see the [blog post](https://kennedn.com/blog/tapo).
+
 Tools and notes for onboarding TP-Link Tapo cameras that use the v3 encryption method **without cloud dependency**. This repo contains:
 
 * Bash clients that perform the two-phase login, derive AES keys, build `securePassthrough` requests, and decrypt the responses.

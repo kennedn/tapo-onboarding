@@ -212,7 +212,7 @@ select_ap() {
     | column -s$'\x1F' -o $'\x1F' -t
   )
 
-  selected_ap=$(fzf --header-lines=1 -d$'\x1F' --with-nth=2.. --prompt "Select Wifi > " <<<"${ap_table}" | awk '{print $1}')
+  selected_ap=$(fzf --header-lines=1 -d$'\x1F' --with-nth=2.. --prompt "Select Wifi > " <<<"${ap_table}" | awk -F$'\x1f' '{print $1}')
   [[ -n "${selected_ap}" ]] || die "No AP selected."
 
   # Secure password prompt (no echo)

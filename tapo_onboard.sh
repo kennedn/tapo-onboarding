@@ -188,7 +188,7 @@ request() {
   decrypt_string "${encrypted_response}"
 }
 
-# Legacy unauthenticated request (for initial login).
+# Legacy unauthenticated request
 # $1: JSON array string for inner request (assumes single request) (e.g. '[{"method":"setOsd","params":{...}}]')
 legacy_request() {
   local request="$1"

@@ -188,6 +188,18 @@ request() {
   decrypt_string "${encrypted_response}"
 }
 
+# Legacy unauthenticated request (for initial login).
+# $1: JSON array string for inner request (assumes single request) (e.g. '[{"method":"setOsd","params":{...}}]')
+legacy_request() {
+  local request="$1"
+
+  curl --connect-timeout 10 -sS \
+    -H "Content-Type: application/json" \
+    -H 'User-Agent: Tapo CameraClient Android' \
+    -kX POST -d "${request}" \
+    "${url}"
+}
+
 ###############################################################################
 # Device operations
 ###############################################################################
@@ -195,20 +207,28 @@ request() {
 # Scan APs, prompt interactively to select Wifi AP via fzf, capture device public key,
 # read Wi-Fi password securely, encrypt it, and return the selected AP JSON + credentials.
 select_ap() {
-  local response ap_table selected_ap wifi_password
+  local response ap_list_key ap_table selected_ap wifi_password
   response=$(request '[{"method":"scanApList","params":{"onboarding":{"scan":{}}}}]')
+  if jq -e '.result.responses[].error_code != 0' <<<"${response}" &>/dev/null; then
+    ap_list_key=".result.onboarding.scan.ap_list"
+    response=$(legacy_request '{"method":"scanApList","params":{"onboarding":{"scan":{}}}}')
+    # Hardcoded public key is used everywhere if we are legacy so just copy it
+    cp pubkey_third_account.pem pubkey.pem
+  else
+    ap_list_key=".result.responses[].result.onboarding.ap_list"
+    # Extract and save device public key for password encryption, it changes every device reset.
+    jq -r '.result.responses[].result.onboarding.public_key' <<<"$response" > pubkey.pem
+  fi
 
-  [[ "$(jq -r '.result.responses[].result.onboarding.ap_list | length' <<<"$response")" -ge 1 ]] \
+
+  [[ "$(jq -r "${ap_list_key} | length" <<<"$response")" -ge 1 ]] \
     || die "No access points found."
 
-  # Extract and save device public key for password encryption, it changes every device reset.
-  jq -r '.result.responses[].result.onboarding.public_key' <<<"$response" > pubkey.pem
-
+  ap_list=$(jq -r "${ap_list_key}" <<<"$response")
   # Pretty table for fzf; keep a RAW JSON column for rehydration.
   ap_table=$(
     jq -r '(["RAW","SSID"," BSSID"] | join("\u001F")),
-           (.result.responses[].result.onboarding.ap_list[]
-             | [@json, .ssid, " \(.bssid)"] | join("\u001F"))' <<<"$response" \
+           (.[] | [@json, .ssid, " \(.bssid)"] | join("\u001F"))' <<<"$ap_list" \
     | column -s$'\x1F' -o $'\x1F' -t
   )
 
@@ -226,10 +246,11 @@ select_ap() {
 
 # Connect to an AP using the object returned by select_ap()
 connect_ap() {
-  local ap_data=$1 body
-  body=$(jq -cnr --argjson ap_data "${ap_data}" \
-    '[{method:"connectAp",params:{onboarding:{connect:$ap_data}}}]')
-  request "${body}"
+  local ap_data=$1
+  response=$(request '[{"method":"connectAp","params":{"onboarding":{"connect":'"${ap_data}"'}}}]')
+  jq -e '.result.responses[].error_code != 0' <<<"${response}" &> /dev/null &&\
+    legacy_request '{"method":"connectAp","params":{"onboarding":{"connect":'"${ap_data}"'}}}' ||\
+    echo "${response}"
 }
 
 # Turn off OSD logo overlay.

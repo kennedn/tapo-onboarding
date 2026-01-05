@@ -16,21 +16,6 @@
 
 set -euo pipefail
 
-# RSA Key for encrypting wifi password:
-# 1024 bit
-RSA_PUBKEY="-----BEGIN PUBLIC KEY-----
-MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC4D6i0oD/Ga5qb//RfSe8MrPVI
-rMIGecCxkcGWGj9kxxk74qQNq8XUuXoy2PczQ30BpiRHrlkbtBEPeWLpq85tfubT
-UjhBz1NPNvWrC88uaYVGvzNpgzZOqDC35961uPTuvdUa8vztcUQjEZy16WbmetRj
-URFIiWJgFCmemyYVbQIDAQAB
------END PUBLIC KEY-----"
-
-# flag the encoding style
-OLD_CAM=0
-
-# print formatted JSON reqests and responses
-DBG_PRINT_JSON=false
-
 ###############################################################################
 # Utilities & guards
 ###############################################################################
@@ -181,15 +166,8 @@ request() {
   local requests=$1
 
   local inner_body payload body raw_response encrypted_response
-  # these messages don't work if wrapped in multipleRequest
-  if [[ "$requests" == *"scanApList"* || "$requests" == *"connectAp"* ]]; then
-    inner_body=$requests
-  else
-    inner_body=$(jq -cn --argjson requests "$requests" \
-      '{method:"multipleRequest",params:{requests:$requests}}')
-  fi
-
-  DBG_PRINT_JSON && jq <<<"${inner_body}" >&2
+  inner_body=$(jq -cn --argjson requests "$requests" \
+    '{method:"multipleRequest",params:{requests:$requests}}')
 
   payload=$(encrypt_string "${inner_body}")
 
@@ -205,16 +183,21 @@ request() {
       -kX POST -d "${body}" \
       "${url}/stok=${stok}/ds"
   )
-  # If "onboarding" is present, it's unencrypted
-  if [[ "$raw_response" == *"onboarding"* ]]; then
-     DBG_PRINT_JSON && jq <<<$raw_response >&2
-     echo "$raw_response"
-  else
-     encrypted_response=$(jq -r '.result.response' <<<"${raw_response}")
-     res=$(decrypt_string "${encrypted_response}")
-     DBG_PRINT_JSON && jq <<<$res >&2
-     echo "$res"
-  fi
+
+  encrypted_response=$(jq -r '.result.response' <<<"${raw_response}")
+  decrypt_string "${encrypted_response}"
+}
+
+# Legacy unauthenticated request (for initial login).
+# $1: JSON array string for inner request (assumes single request) (e.g. '[{"method":"setOsd","params":{...}}]')
+legacy_request() {
+  local request="$1"
+
+  curl --connect-timeout 10 -sS \
+    -H "Content-Type: application/json" \
+    -H 'User-Agent: Tapo CameraClient Android' \
+    -kX POST -d "${request}" \
+    "${url}"
 }
 
 ###############################################################################
@@ -224,28 +207,28 @@ request() {
 # Scan APs, prompt interactively to select Wifi AP via fzf, capture device public key,
 # read Wi-Fi password securely, encrypt it, and return the selected AP JSON + credentials.
 select_ap() {
-  local response ap_table selected_ap wifi_password
-  response=$(request '{"method":"scanApList","params":{"onboarding":{"scan":{}}}}')
+  local response ap_list_key ap_table selected_ap wifi_password
+  response=$(request '[{"method":"scanApList","params":{"onboarding":{"scan":{}}}}]')
+  if jq -e '.result.responses[].error_code != 0' <<<"${response}" &>/dev/null; then
+    ap_list_key=".result.onboarding.scan.ap_list"
+    response=$(legacy_request '{"method":"scanApList","params":{"onboarding":{"scan":{}}}}')
+    # Hardcoded public key is used everywhere if we are legacy so just copy it
+    cp pubkey_third_account.pem pubkey.pem
+  else
+    ap_list_key=".result.responses[].result.onboarding.ap_list"
+    # Extract and save device public key for password encryption, it changes every device reset.
+    jq -r '.result.responses[].result.onboarding.public_key' <<<"$response" > pubkey.pem
+  fi
 
-  [[ "$(jq -r '.result.onboarding.scan.ap_list | length' <<<"$response")" -ge 1 ]] \
+
+  [[ "$(jq -r "${ap_list_key} | length" <<<"$response")" -ge 1 ]] \
     || die "No access points found."
 
-  # If the devices provides one, extract and save device public key for password encryption,
-  # it changes every device reset. Otherwise, use the hardcoded key.
-  if [[ "$response" == *"public_key"* ]]; then
-    jq -r '.result.onboarding.scan.public_key' <<<"$response" > pubkey.pem 
-  else
-    echo "Old firmware; using hardcoded key." >&2
-    echo "$RSA_PUBKEY" > pubkey.pem
-    OLD_CAM=1
-  fi
- 
-
+  ap_list=$(jq -r "${ap_list_key}" <<<"$response")
   # Pretty table for fzf; keep a RAW JSON column for rehydration.
   ap_table=$(
     jq -r '(["RAW","SSID"," BSSID"] | join("\u001F")),
-           (.result.onboarding.scan.ap_list[]
-             | [@json, .ssid, " \(.bssid)"] | join("\u001F"))' <<<"$response" \
+           (.[] | [@json, .ssid, " \(.bssid)"] | join("\u001F"))' <<<"$ap_list" \
     | column -s$'\x1F' -o $'\x1F' -t
   )
 
@@ -263,10 +246,11 @@ select_ap() {
 
 # Connect to an AP using the object returned by select_ap()
 connect_ap() {
-  local ap_data=$1 body
-  body=$(jq -cnr --argjson ap_data "${ap_data}" \
-    '{method:"connectAp",params:{onboarding:{connect:$ap_data}}}')
-  request "${body}"
+  local ap_data=$1
+  response=$(request '[{"method":"connectAp","params":{"onboarding":{"connect":'"${ap_data}"'}}}]')
+  jq -e '.result.responses[].error_code != 0' <<<"${response}" &> /dev/null &&\
+    legacy_request '{"method":"connectAp","params":{"onboarding":{"connect":'"${ap_data}"'}}}' ||\
+    echo "${response}"
 }
 
 # Turn off OSD logo overlay.
@@ -274,19 +258,6 @@ disable_logo() {
   local body
   body=$(jq -cnr \
     '[{method:"setOsd",params:{OSD:{logo:{enabled:"off",x_coor:"0",y_coor:"9150"}}}}]')
-  request "${body}"
-}
-
-# set the device alias with setDeviceAlias
-# format is {device_model-XXXXXX} with X replaced by the 
-# last 6 hex characters of the MAC address
-set_device_alias() {
-  local info alias
-  info=$(dev_info)
-  alias=$(jq -r '.result.responses[0].result.device_info.basic_info 
-    | "\(.device_model)-\(.mac | gsub("[:-]"; "") | .[-6:])"' <<<"$info")
-  body=$(jq -cnr --arg alias "${alias}" \
-    '[{method:"setDeviceAlias",params:{system:{sys:{dev_alias:$alias}}}}]')
   request "${body}"
 }
 
@@ -339,20 +310,6 @@ change_third_account() {
   request "${body}"
 }
 
-# request the device information
-dev_info() {
-  local body
-  body=$(jq -cnr '[{method:"getDeviceInfo",params:{device_info:{name:["basic_info"]}}}]')
-  request "${body}"
-}
-
-# send a reset command
-reset() {
-  local body
-  body=$(jq -cnr '[{method:"reset",params:{system:{reset:{}}}}]')
-  request "${body}"
-}
-
 ###############################################################################
 # Main flow
 ###############################################################################
@@ -372,14 +329,6 @@ main() {
   # 1) Login with default password
   login "${host}" "${default_password}"
 
-  # 1.1) Get device info - for now, only prints with debug turned on
-  #local device_info
-  #device_info=$(dev_info)
-  
-  # 1.2) Set device alias (optional)
-  #echo "Setting device alias"
-  #set_device_alias
-
   # 2) Scan/select Wi-Fi
   # Cleanup pubkey.pem on exit, downloaded by select_ap()
   trap 'rm -f pubkey.pem' EXIT
@@ -387,7 +336,7 @@ main() {
   local ap_data
   ap_data=$(select_ap)
 
-  # 3) Cosmetic: disable OSD logo (optional)
+  # 3) Cosmetic: disable OSD logo
   echo "Disable tapo logo"
   disable_logo
 
@@ -405,10 +354,6 @@ main() {
   # 7) Connect to selected AP
   echo "Connecting to access point"
   connect_ap "${ap_data}"
-
-  # last step reset
-  #echo "Resetting"
-  #reset # reset doesn't seem to be needed
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

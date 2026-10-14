@@ -6,7 +6,7 @@
 # - Change tapo API admin password to specified password
 # - Scan & connect to Wi-Fi.
 #
-# Requirements: bash, curl, jq, openssl, fzf, column
+# Requirements: bash (3.2+), curl, jq, openssl, fzf, awk
 #
 # Usage:
 #   ./tapo_onboard.sh <host> <new_password>
@@ -70,7 +70,7 @@ encrypt_string() {
 # AES-128-CBC base64 decode + decrypt to plaintext. Uses lsk/ivb.
 decrypt_string() {
   local value=$1
-  printf '%s' "${value}" | openssl enc -aes-128-cbc -K "${lsk}" -iv "${ivb}" -d -a -A
+  printf '%s' "${value}" | openssl enc -aes-128-cbc -K "${lsk}" -iv "${ivb}" -d -a -A || return
   echo
 }
 
@@ -87,7 +87,7 @@ public_key_encode() {
   local pem_file=$1 value=$2
   [[ -f "${pem_file}" ]] || die "${pem_file} does not exist"
   printf '%s' "${value}" \
-    | openssl pkeyutl -encrypt -inkey "${pem_file}" -pubin -pkeyopt rsa_padding_mode:pkcs1 \
+    | openssl pkeyutl -encrypt -pubin -inkey "${pem_file}" -pkeyopt rsa_padding_mode:pkcs1 \
     | openssl base64 -A
 }
 
@@ -155,37 +155,34 @@ login() {
   export hashed_password cnonce lsk ivb seq stok
 }
 
-# Atomically post-increment and print the current seq.
-next_seq() {
-  echo "$((seq++))"
-}
-
-# Wrap a list of inner requests in securePassthrough with encryption and headers, then decrypt response.
-# $1: JSON array string of inner requests (e.g. '[{"method":"setOsd","params":{...}}]')
+# Wrap requests using the session keys and return the decrypted JSON response.
+# $2 (optional): caller variable for the response. Use this instead of command
+# substitution when making multiple requests, so sequence updates survive.
 request() {
   local requests=$1
-
-  local inner_body payload body raw_response encrypted_response
+  local inner_body payload body raw_response encrypted_response plaintext
   inner_body=$(jq -cn --argjson requests "$requests" \
     '{method:"multipleRequest",params:{requests:$requests}}')
-
   payload=$(encrypt_string "${inner_body}")
-
   body=$(jq -cn --arg payload "$payload" \
     '{method:"securePassthrough",params:{request:$payload}}')
-
   raw_response=$(
     curl --connect-timeout 10 -sS \
       -H "Content-Type: application/json" \
       -H "tapo_tag: $(tapo_tag "${body}")" \
-      -H "seq: $(next_seq)" \
+      -H "seq: ${seq}" \
       -H 'User-Agent: Tapo CameraClient Android' \
       -kX POST -d "${body}" \
       "${url}/stok=${stok}/ds"
-  )
-
-  encrypted_response=$(jq -r '.result.response' <<<"${raw_response}")
-  decrypt_string "${encrypted_response}"
+  ) || return
+  seq=$((seq + 1))
+  encrypted_response=$(jq -er '.result.response | select(type == "string" and length > 0)' <<<"${raw_response}") || return
+  plaintext=$(decrypt_string "${encrypted_response}") || return
+  if [[ -n "${2:-}" ]]; then
+    printf -v "$2" '%s' "${plaintext}"
+  else
+    printf '%s\n' "${plaintext}"
+  fi
 }
 
 # Legacy unauthenticated request
@@ -204,11 +201,23 @@ legacy_request() {
 # Device operations
 ###############################################################################
 
+# Format AP JSON from stdin as rows for fzf. BSD column lacks GNU column's -o
+# option. Keep untouched JSON in the hidden field; sanitize display labels only.
+format_ap_table() {
+  jq -r '
+    def ssid_label: .ssid | gsub("[\u0000-\u001f\u007f]"; " ");
+    def pad($width): . + (" " * ($width - length));
+    ([4] + map(ssid_label | length) | max) as $width |
+    (["RAW", ("SSID" | pad($width)), " BSSID"] | join("\u001f")),
+    (.[] | [@json, (ssid_label | pad($width)), " \(.bssid)"] | join("\u001f"))
+  '
+}
+
 # Scan APs, prompt interactively to select Wifi AP via fzf, capture device public key,
 # read Wi-Fi password securely, encrypt it, and return the selected AP JSON + credentials.
 select_ap() {
-  local response ap_list_key ap_table selected_ap wifi_password
-  response=$(request '[{"method":"scanApList","params":{"onboarding":{"scan":{}}}}]')
+  local response ap_list_key ap_list ap_table selected_ap wifi_password ap_json
+  request '[{"method":"scanApList","params":{"onboarding":{"scan":{}}}}]' response || return
   if jq -e '.result.responses[].error_code != 0' <<<"${response}" &>/dev/null; then
     ap_list_key=".result.onboarding.scan.ap_list"
     response=$(legacy_request '{"method":"scanApList","params":{"onboarding":{"scan":{}}}}')
@@ -225,29 +234,31 @@ select_ap() {
     || die "No access points found."
 
   ap_list=$(jq -r "${ap_list_key}" <<<"$response")
-  # Pretty table for fzf; keep a RAW JSON column for rehydration.
-  ap_table=$(
-    jq -r '(["RAW","SSID"," BSSID"] | join("\u001F")),
-           (.[] | [@json, .ssid, " \(.bssid)"] | join("\u001F"))' <<<"$ap_list" \
-    | column -s$'\x1F' -o $'\x1F' -t
-  )
+  ap_table=$(format_ap_table <<<"$ap_list") || die "Unable to format access points."
 
-  selected_ap=$(fzf --header-lines=1 -d$'\x1F' --with-nth=2.. --prompt "Select Wifi > " <<<"${ap_table}" | awk -F$'\x1f' '{print $1}')
+  selected_ap=$(fzf --header-lines=1 -d$'\x1F' --with-nth=2.. --prompt "Select Wifi > " <<<"${ap_table}" | awk -F$'\x1f' '{print $1}') \
+    || die "No AP selected."
   [[ -n "${selected_ap}" ]] || die "No AP selected."
 
   # Secure password prompt (no echo)
-  read -r -s -p "Wifi Password: " wifi_password
+  IFS= read -r -s -p "Wifi Password: " wifi_password < /dev/tty \
+    || die "Unable to read Wi-Fi password from terminal."
   printf '\n' >&2
   wifi_password=$(public_key_encode pubkey.pem "${wifi_password}")
 
   # Return: selected AP object + unique_key + encrypted password
-  jq -rc --arg wifi_password "${wifi_password}" '. + {unique_key:1, password:$wifi_password}' <<<"${selected_ap}"
+  ap_json=$(jq -rc --arg wifi_password "${wifi_password}" '. + {unique_key:1, password:$wifi_password}' <<<"${selected_ap}") || return
+  if [[ -n "${1:-}" ]]; then
+    printf -v "$1" '%s' "${ap_json}"
+  else
+    printf '%s\n' "${ap_json}"
+  fi
 }
 
 # Connect to an AP using the object returned by select_ap()
 connect_ap() {
   local ap_data=$1
-  response=$(request '[{"method":"connectAp","params":{"onboarding":{"connect":'"${ap_data}"'}}}]')
+  request '[{"method":"connectAp","params":{"onboarding":{"connect":'"${ap_data}"'}}}]' response || return
   jq -e '.result.responses[].error_code != 0' <<<"${response}" &> /dev/null &&\
     legacy_request '{"method":"connectAp","params":{"onboarding":{"connect":'"${ap_data}"'}}}' ||\
     echo "${response}"
@@ -315,7 +326,7 @@ change_third_account() {
 ###############################################################################
 
 main() {
-  require_cmds bash curl jq openssl fzf column
+  require_cmds bash curl jq openssl fzf awk
 
   # Arguments
   local host=${1:-}
@@ -334,7 +345,7 @@ main() {
   trap 'rm -f pubkey.pem' EXIT
   echo "Scanning for Wifi access points..."
   local ap_data
-  ap_data=$(select_ap)
+  select_ap ap_data
 
   # 3) Cosmetic: disable OSD logo
   echo "Disable tapo logo"

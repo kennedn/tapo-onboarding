@@ -33,7 +33,27 @@ This script performs a complete onboard for a Tapo Camera:
 
 ### Prerequisites
 
-* Linux/Mac with Bash, `jq`, `curl`, `openssl`, `fzf`, `column`
+* Linux/macOS with Bash 3.2 or newer, `jq`, `curl`, `openssl`, `fzf`, and `awk`
+* An interactive terminal for AP selection and the hidden Wi-Fi password prompt
+
+The scripts work with macOS's bundled Bash (`/bin/bash`), even if your login
+shell is zsh. Run them directly as shown below, or use `bash tapo_onboard.sh`;
+do not run them with `sh` or `zsh`. No GNU `column` or other GNU core utilities
+are required. Base64 encoding/decoding uses OpenSSL rather than the
+platform-specific `base64` command.
+
+On macOS, install missing dependencies with Homebrew:
+
+```bash
+brew install jq fzf
+```
+
+macOS's bundled LibreSSL (`/usr/bin/openssl`) is supported; Homebrew OpenSSL
+also works.
+
+Run from the repository directory so the script can find
+`pubkey_third_account.pem`. Connect the Mac to the camera's Wi-Fi AP before
+running the script; the AP scan is performed by the camera, not by macOS.
 
 ### Usage
 
@@ -55,6 +75,18 @@ Configure RTSP / ONVIF account
 Change tapo API admin password
 Connecting to access point
 ```
+
+After the connection request is accepted, the camera's setup Wi-Fi may
+disappear. Reconnect your computer to your home Wi-Fi and find the camera's
+new IP in your router's client list. Open `rtsp://<camera-ip>:554/stream1` in
+VLC, replacing `<camera-ip>` with that address, and log in as `tapoadmin`
+with the camera password supplied to the script.
+
+Errors identify the provisioning stage and, where available, the camera's
+numeric error code or curl exit status. The script stops on failed operations
+within a request batch. If it stops after changing the admin password, it
+reports that fact: do not rerun the default-password onboarding command.
+Diagnostics do not dump response payloads or passwords.
 
 ---
 
@@ -101,6 +133,25 @@ Example:
   "error_code": 0
 }
 ```
+
+---
+
+## Tests
+
+Camera-free regression tests use Python 3's standard library and the script
+dependencies above. They cover table formatting, preservation of AP metadata
+with real `fzf` filtering, empty scans, cancellation, request sequence/signature
+handling, login validation, transport and API errors, partial provisioning,
+and the cryptographic helpers. The interactive password prompt and full provisioning still need
+testing with a physical camera.
+
+```bash
+python3 -m unittest discover -s tests -v
+bash -n tapo_onboard.sh tCurl.sh
+```
+
+Set `TEST_BASH=/path/to/bash` to test another Bash version. These checks do not
+replace testing the full onboarding flow against a physical camera.
 
 ---
 
